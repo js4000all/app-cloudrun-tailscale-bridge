@@ -1,6 +1,60 @@
 # app-cloudrun-tailscale-bridge
 
-A Python/Flask HTTP service for Google Cloud Run that joins a Tailscale tailnet in userspace mode. This iteration verifies the Tailscale connection; SSH to an edge VM and Google Apps Script integration remain separate steps.
+A Python/Flask HTTP service for Google Cloud Run that joins a Tailscale tailnet in userspace mode and forwards authenticated HTTP requests to Tailscale SSH. The caller supplies the host, login user, and command.
+
+
+## Getting started
+
+High-level steps to connect a trusted HTTP caller (such as Google Apps Script) to a Tailscale SSH-enabled edge host. GAS custom-audience/token configuration is documented separately.
+
+### 1. Tailscale: bridge and edge
+
+1. Join the destination Linux host to the tailnet, assign it `tag:edge`, ensure the intended OS login account exists, and enable Tailscale SSH using `sudo tailscale set --ssh`.
+2. Define owners for `tag:bridge` and `tag:edge` in your tailnet policy. Allow **both** TCP/22 network access from `tag:bridge` to `tag:edge` and an SSH `accept` rule for permitted destination OS accounts. This sample is a **fragment to merge into your existing policy** (not a complete replacement):
+   ```json
+   {
+     "tagOwners": {
+       "tag:bridge": ["autogroup:admin"],
+       "tag:edge": ["autogroup:admin"]
+     },
+     "grants": [
+       {"src": ["tag:bridge"], "dst": ["tag:edge"], "ip": ["tcp:22"]}
+     ],
+     "ssh": [
+       {"action": "accept", "src": ["tag:bridge"], "dst": ["tag:edge"], "users": ["bridge"]}
+     ]
+   }
+   ```
+   Replace the example OS username `bridge` with the accounts you intend to allow. Tagged source devices cannot use interactive SSH `check` rules. Actual authorization is enforced by the Tailscale policy, not by an application-side allowlist.
+3. Generate a tagged auth key with **Reusable = true**, **Ephemeral = true**, and **tag:bridge** assigned. The service uses `--state=mem:` and authenticates each new Cloud Run instance as a new node; a non-reusable key will fail on later starts. Auth keys expire (maximum 90 days), so plan rotation.
+
+### 2. Google Cloud project and Secret Manager
+
+1. Choose a project with billing enabled and enable the necessary APIs: Cloud Run, Cloud Build, Artifact Registry, and Secret Manager. Set up the appropriate build/deploy permissions for deploying from GitHub.
+2. Create a Secret Manager secret containing the Tailscale auth key (for example, `tailscale-auth-key`). Never commit it or include it directly in build logs or the image.
+3. When rotating the key, add a secret version and make sure a new Cloud Run revision receives the updated version.
+
+### 3. IAM: service account and caller
+
+1. Create a **dedicated Cloud Run runtime service account**, for example `cloudrun-tailscale-bridge`.
+2. Grant this account `roles/secretmanager.secretAccessor` on the auth-key secret (not necessarily the whole project).
+3. Grant `roles/run.invoker` on the Cloud Run service only to the trusted HTTP calling principal. The caller and the Cloud Run runtime service account are different identities.
+4. Ensure your deployer has permission to deploy and attach the runtime service account (`roles/iam.serviceAccountUser`). The Cloud Build identity also needs its own build/deploy permissions; it is separate from the Cloud Run runtime identity.
+
+### 4. Cloud Run: deploy from this repository
+
+1. Create a Cloud Run **service** from this GitHub repository, using its `Dockerfile`. Configure the repository connection/Cloud Build trigger if you want automatic deployments.
+2. Choose a region, assign the runtime service account, and select **Require authentication**. For GAS to call the service's public URL, configure ingress **All** while retaining IAM authentication. Do **not** permit unauthenticated calls.
+3. Map the Secret Manager secret to environment variable **`TS_AUTHKEY`** (required). `TS_HOSTNAME` is optional. Do not set `TS_SSH_HOST` or `TS_SSH_USER`: the HTTP request supplies `host` and `user`.
+4. Deploy. Tailscale must authenticate before Gunicorn starts listening on the Cloud Run `PORT` (default `8080`). If startup fails, inspect the revision logs, especially for invalid/expired auth keys.
+5. Invoke `GET /health`, then `POST /exec` as an authenticated caller:
+   ```json
+   {"host":"edge-node-01","user":"bridge","command":"uname -a"}
+   ```
+   Check `exit_code` and `stderr`, not only HTTP 200. Unknown hosts and denied SSH logins are reported by the SSH CLI in the response.
+
+**Security:** This is an arbitrary remote command API. Restrict HTTP callers via Cloud Run IAM and destination hosts/users via Tailscale policies. Review permitted OS account privileges, key rotation, concurrency, and operational logging before production use.
+
 
 ## Health endpoint
 
@@ -81,7 +135,7 @@ curl -i -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL/hea
 
 ## Scope
 
-This is a Tailnet registration and local daemon health probe, not a connection test to an edge VM. Edge SSH and edge information collection will be added in follow-up work.
+This service provides Tailnet connectivity and low-level SSH command forwarding. Structured edge information collection, interactive SSH, and command-level authorization are outside its current scope.
 
 References: https://tailscale.com/docs/install/cloud/cloudrun and https://tailscale.com/docs/concepts/userspace-networking.
 
