@@ -84,3 +84,32 @@ curl -i -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL/hea
 This is a Tailnet registration and local daemon health probe, not a connection test to an edge VM. Edge SSH and edge information collection will be added in follow-up work.
 
 References: https://tailscale.com/docs/install/cloud/cloudrun and https://tailscale.com/docs/concepts/userspace-networking.
+
+
+## SSH command execution proof of concept
+
+**Security boundary:** `POST /exec` accepts arbitrary remote shell commands and a target host. Protect the Cloud Run service with **Require authentication**, grant `roles/run.invoker` only to trusted callers, and do not deploy this API anonymously. Tailscale ACLs/grants and SSH policy determine which Tailnet hosts and remote OS accounts can be reached. No duplicate application-level host allowlist is maintained. Do not accept command strings from untrusted callers.
+
+Configure the Cloud Run environment:
+
+- `TS_SSH_USER` (required): remote OS account used for all SSH requests; use a least-privileged account
+- `SSH_TIMEOUT_SECONDS` (optional, default `20`, range 1–300): total SSH command execution deadline
+- `SSH_MAX_OUTPUT_BYTES` (optional, default `16384`, range 1024–1048576): retained output bytes **per stream**
+- `SSH_MAX_COMMAND_BYTES` (optional, default `4096`, range 1–1048576): maximum UTF-8 command input length
+
+Do **not** set `TS_SSH_HOST`: each request supplies `host`. The service validates only host syntax (DNS/MagicDNS hostname or IP), **not** host authorization. Enable Tailscale SSH on each destination Linux machine with `sudo tailscale set --ssh`. Tailnet policy must allow TCP/22 and an SSH `accept` rule from the Cloud Run device/tag to the requested destination and login user. Tagged sources cannot use interactive SSH `check` mode.
+
+Call from an authenticated client:
+
+```bash
+curl -sS -i -X POST "$URL/exec" \
+  -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  -H "Content-Type: application/json" \
+  --data '{"host":"edge-node-01","command":"uname -a"}'
+```
+
+Normal execution returns HTTP 200 with `host`, `exit_code`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`. An SSH connection error (unknown or offline host, network problem, SSH policy denial) **may also return HTTP 200** with a nonzero exit code and diagnostic `stderr`. Since the CLI uses OpenSSH, its exit code (commonly 255 for SSH connection errors) can overlap with legitimate remote command exit codes; this endpoint preserves diagnostics instead of guessing which failed. Inspect exit code and stderr. The bridge does not imply that HTTP 200 means remote execution succeeded.
+
+Invalid inputs return HTTP 400/415, unconfigured SSH/Tailscale returns 503, CLI process spawn problems return 502, and timeout returns 504. A single timeout applies to setup and command execution. SSH subprocesses are launched without a **local** shell, but remote commands **are interpreted by the remote shell**, including metacharacters.
+
+Output is drained continuously to avoid subprocess pipe deadlock and is held in memory only up to the configured bytes per stream. Extra output is discarded but consumed, allowing commands to finish normally. The request does not stream output and does not accept stdin. A timeout kills the local SSH process group; a background or detached **remote** process can survive. The current implementation does not guarantee cancelling remote work or enforce a concurrency cap. `tailscale status` Running only confirms the local daemon, not destination SSH reachability.
