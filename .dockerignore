@@ -6,3 +6,7 @@ __pycache__
 .venv
 tests
 requirements-dev.txt
+.env
+.env.*
+*.pem
+*.key
