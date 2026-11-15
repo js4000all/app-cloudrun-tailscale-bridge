@@ -3,6 +3,31 @@
 A Python/Flask HTTP service for Google Cloud Run that joins a Tailscale tailnet in userspace mode and forwards authenticated HTTP requests to Tailscale SSH. The caller supplies the host, login user, and command.
 
 
+## Why this bridge exists
+
+Some systems, such as Google Apps Script (GAS), can make HTTPS requests but cannot run a Tailscale client and directly join a tailnet. This project lets such systems **push commands to a Tailscale-connected machine on demand**, without exposing an SSH port or an HTTP server on the destination machine to the public internet.
+
+```mermaid
+flowchart LR
+    caller["GAS / HTTP client<br/>(outside the tailnet)"]
+    bridge["Cloud Run bridge<br/>HTTP → Tailscale SSH"]
+    edge["Edge node<br/>Tailscale SSH enabled"]
+
+    caller -->|"HTTPS POST /exec<br/>Cloud Run IAM"| bridge
+    bridge -->|"SSH over tailnet<br/>Tailscale policy"| edge
+    edge -.->|"exit code + stdout/stderr"| bridge
+    bridge -.->|"JSON response"| caller
+
+    subgraph tailnet["Tailnet"]
+        bridge
+        edge
+    end
+```
+
+The caller supplies a host, OS login user, and command over HTTPS. Cloud Run checks the caller through **IAM**, while the **Tailscale network and SSH policies** decide which destinations and login accounts the bridge may access. The bridge returns the remote exit code and output in the HTTP response. This is a synchronous, caller-initiated **push** workflow; edge nodes do not need to poll for work, and the bridge does not queue jobs.
+
+The design aims to be **inexpensive for intermittent use**: Cloud Run can scale to zero when idle (`min instances = 0`), and `tailscaled` runs in userspace mode without a VM or a permanently running gateway. There can still be charges for Cloud Run requests/compute, image builds and storage, Secret Manager, and network traffic. Cold starts include Tailscale registration, and this approach is not intended for long-running or interactive SSH sessions.
+
 ## Getting started
 
 High-level steps to connect a trusted HTTP caller (such as Google Apps Script) to a Tailscale SSH-enabled edge host. GAS custom-audience/token configuration is documented separately.
