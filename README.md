@@ -84,3 +84,28 @@ curl -i -H "Authorization: Bearer $(gcloud auth print-identity-token)" "$URL/hea
 This is a Tailnet registration and local daemon health probe, not a connection test to an edge VM. Edge SSH and edge information collection will be added in follow-up work.
 
 References: https://tailscale.com/docs/install/cloud/cloudrun and https://tailscale.com/docs/concepts/userspace-networking.
+
+
+## SSH command execution proof of concept
+
+`POST /exec` runs a command on one preconfigured Tailnet host using `tailscale ssh`. This is a **privileged remote-code-execution endpoint**: keep Cloud Run **Require authentication** enabled, grant `roles/run.invoker` only to trusted identities, and never expose it anonymously. The Flask application intentionally does not implement independent HTTP authentication.
+
+Configure the Cloud Run environment variables:
+
+- `TS_SSH_HOST`: destination Tailscale MagicDNS name or Tailscale IP (for example `edge-host`)
+- `TS_SSH_USER`: destination OS account (prefer a restricted non-root account, for example `bridge`)
+
+On the destination Linux host, enable Tailscale SSH with `sudo tailscale set --ssh`. Tailnet policy must permit BOTH TCP/22 from the Cloud Run device/tag to the destination and an SSH `accept` rule for the chosen OS login. Tagged source devices cannot use interactive SSH `check` mode. Prefer a dedicated Cloud Run device tag and destination tag with least-privilege policy.
+
+Example from an authorized caller (replace `URL` as needed):
+
+```bash
+curl -sS -i -X POST "$URL/exec" \
+  -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  -H "Content-Type: application/json" \
+  --data '{"command":"uname -a"}'
+```
+
+The response contains `exit_code`, `stdout`, `stderr`, `stdout_truncated`, and `stderr_truncated`. Nonzero remote exit status is reported in JSON with HTTP 200; infrastructure errors use HTTP 502/503/504. Each stream is limited to 16 KiB in the HTTP response and each invocation has a 20-second timeout. The command is passed as one argument to `tailscale ssh` without a **local** shell; SSH runs it using the remote account's shell, so shell metacharacters in the command are meaningful. Do not accept command strings from untrusted users.
+
+This proof of concept does not support interactive SSH, streaming responses, stdin forwarding, per-user authorization, or an application-level command allowlist. `tailscale status` showing Running alone does not confirm SSH permissions or reachability.
