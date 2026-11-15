@@ -126,6 +126,8 @@ def test_ssh_subprocess_streams(monkeypatch):
     monkeypatch.setenv("TS_SOCKET_PATH", "/tmp/custom.sock")
     monkeypatch.setenv("SSH_MAX_OUTPUT_BYTES", "1024")
     class FakePipe:
+        def fileno(self):
+            return 42
         def close(self):
             pass
     class FakeProcess:
