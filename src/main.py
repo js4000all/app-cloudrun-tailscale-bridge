@@ -43,6 +43,8 @@ def health():
 
 
 
+SSH_USER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,62}[$]?$")
+
 HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
@@ -56,6 +58,10 @@ def valid_host(host):
         return all(HOST_LABEL.fullmatch(label) for label in host.split("."))
 
 
+def valid_user(user):
+    return isinstance(user, str) and len(user) <= 64 and SSH_USER.fullmatch(user) is not None
+
+
 def setting_int(name, default, minimum, maximum):
     try:
         value = int(os.environ.get(name, str(default)))
@@ -66,9 +72,8 @@ def setting_int(name, default, minimum, maximum):
     return value
 
 
-def run_ssh_command(host, command):
+def run_ssh_command(host, user, command):
     """Drain SSH output as it arrives, retaining only bounded response buffers."""
-    user = os.environ["TS_SSH_USER"]
     socket_path = os.environ.get("TS_SOCKET_PATH", "/tmp/tailscaled.sock")
     timeout = setting_int("SSH_TIMEOUT_SECONDS", 20, 1, 300)
     limit = setting_int("SSH_MAX_OUTPUT_BYTES", 16384, 1024, 1048576)
@@ -123,6 +128,7 @@ def run_ssh_command(host, command):
 
     return {
         "host": host,
+        "user": user,
         "exit_code": exit_code,
         "stdout": outputs["stdout"].decode("utf-8", errors="replace"),
         "stderr": outputs["stderr"].decode("utf-8", errors="replace"),
@@ -142,9 +148,12 @@ def execute():
         return jsonify(error="JSON object required"), 400
 
     host = payload.get("host")
+    user = payload.get("user")
     command = payload.get("command")
     if not valid_host(host):
         return jsonify(error="host must be a valid MagicDNS hostname or IP address"), 400
+    if not valid_user(user):
+        return jsonify(error="user must be a valid OS login name"), 400
     if not isinstance(command, str) or not command.strip() or "\x00" in command:
         return jsonify(error="command must be a non-empty string without NUL"), 400
     try:
@@ -157,14 +166,12 @@ def execute():
     if len(command.encode("utf-8")) > max_command:
         return jsonify(error=f"command must be at most {max_command} bytes"), 400
 
-    if not os.environ.get("TS_SSH_USER"):
-        return jsonify(error="SSH user is not configured"), 503
     if get_tailscale_backend_state() != "Running":
         return jsonify(error="Tailscale is not connected"), 503
     try:
         # CLI and OpenSSH failures can share exit codes with remote commands.
         # Preserve the raw exit code and stderr; do not guess the failure category.
-        return jsonify(run_ssh_command(host, command)), 200
+        return jsonify(run_ssh_command(host, user, command)), 200
     except subprocess.TimeoutExpired:
         return jsonify(error="SSH command timed out", host=host), 504
     except (OSError, subprocess.SubprocessError):
